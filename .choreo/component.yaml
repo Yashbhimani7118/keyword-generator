@@ -1,0 +1,15 @@
+componentType: Service
+name: keyword-generator
+displayName: Keyword Generator AI
+visibility: Public
+build:
+  buildpacks:
+    - python
+  env:
+    - name: PORT
+      value: "8080"
+endpoints:
+  - name: REST API
+    port: 8080
+    type: REST
+    context: /
