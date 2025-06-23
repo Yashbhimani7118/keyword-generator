@@ -15,7 +15,7 @@ HEADERS = {
 # Adjust this model ID to a free-tier OpenRouter model you prefer:
 MODEL_ID = "gpt-3.5-turbo"  
 
-@app.route("/generate-keywords", methods=["POST"])
+@app.route("/", methods=["POST"])
 def generate_keywords():
     data = request.json or {}
     # Build the text blob from survey answers:
