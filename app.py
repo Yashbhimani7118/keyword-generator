@@ -3,18 +3,16 @@ import json
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from typing import List, Dict
 
 # --- CONFIGURATION ---
 load_dotenv()
 app = Flask(__name__)
 
-# Your OpenRouter API Key, set as an environment variable
-OR_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OR_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# You can choose a fast and free/low-cost model from OpenRouter
-# e.g., "google/gemma-7b-it", "mistralai/mistral-7b-instruct"
-AI_MODEL = "google/gemma-7b-it"
+OR_API_KEY = os.getenv("OPENROUTER_API_KEY", "<YOUR_OPENROUTER_KEY>")
+OR_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Using a powerful free model that's good at instruction following
+AI_MODEL = "mistralai/mistral-7b-instruct:free"
 
 HEADERS = {
     "Authorization": f"Bearer {OR_API_KEY}",
@@ -23,153 +21,131 @@ HEADERS = {
 
 
 # --- MAPPINGS & LOGIC ---
-# These mappings help convert survey answers to concrete data
 
-SOURCE_MAP = {
-    "Leading global outlets (e.g., BBC, Reuters)": ["bbc.com", "reuters.com", "nytimes.com", "aljazeera.com"],
-    "Industry-specific journals": ["hbr.org", "forbes.com"],
-    "Local newspapers/websites": ["divyabhaskar.co.in", "sandesh.com", "gujaratsamachar.com"],
-    "Independent blogs/podcasts": [] # Can be expanded later
-}
-
-GEO_MAP = {
-    "Ahmedabad": ["Ahmedabad", "Gujarat", "Gandhinagar"],
-    "Surat": ["Surat", "Gujarat"],
-    "Rajkot": ["Rajkot", "Gujarat"]
-    # Add other cities as needed
-}
-
-def get_ai_expanded_keywords(base_keywords: list) -> list:
+def get_ai_expanded_keywords_for_category(base_keywords: list, category: str) -> list:
     """
-    Uses OpenRouter to get semantically related keywords.
+    Uses OpenRouter to get semantically related keywords FOR A SPECIFIC CATEGORY.
     """
-    if not OR_API_KEY:
-        print("Warning: OPENROUTER_API_KEY is not set. Skipping AI expansion.")
+    if not base_keywords or not OR_API_KEY:
         return []
 
-    # Create a focused prompt for the AI
+    # Craft a more specific, category-aware prompt
     prompt = (
-        "You are a keyword expansion expert for a news feed. Based on the following user interest keywords, "
-        "generate a list of up to 5 additional, highly relevant and specific sub-topics, technologies, or related concepts. "
-        "For example, if you see 'Venture Capital', you might add 'Series A Funding'. If you see 'Python', add 'Data Science' or 'FastAPI'.\n\n"
-        f"Base keywords: {', '.join(base_keywords)}\n\n"
-        "Respond ONLY with a JSON list of strings. For example: [\"keyword1\", \"keyword2\"]"
+        "You are an expert keyword generator for a news feed. Your task is to expand on a list of user-provided keywords for a specific category. "
+        "For the given category and base keywords, generate a list of up to 3 additional, highly relevant keywords. \n\n"
+        "RULES:\n"
+        "1. Each keyword MUST be short and concise (1 to 3 words maximum).\n"
+        "2. Do NOT generate long sentences or descriptive phrases.\n"
+        "3. The keywords should be specific sub-topics, technologies, or named entities related to the base keywords.\n"
+        "4. Respond ONLY with a valid JSON list of strings.\n\n"
+        f"Category: \"{category}\"\n"
+        f"Base Keywords: {', '.join(base_keywords)}\n\n"
+        "Example of good output for Base Keywords ['Stock Markets', 'Venture Capital']:\n"
+        "[\"IPO\", \"Angel Investors\", \"Market Analysis\"]\n\n"
+        "Example of BAD output:\n"
+        "[\"The impact of interest rates on stock market performance\", \"Venture capital funding rounds for tech startups\"]"
     )
 
-    payload = {
-        "model": AI_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"} # Ask for a JSON response
-    }
+    payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}]}
 
     try:
-        response = requests.post(OR_API_URL, headers=HEADERS, json=payload, timeout=90)
+        response = requests.post(OR_CHAT_URL, headers=HEADERS, json=payload, timeout=90)
         response.raise_for_status()
-        
-        # The AI's response is a JSON string inside the content
         content_str = response.json()["choices"][0]["message"]["content"]
-        # It might be wrapped in ```json ... ```, so we clean it
-        cleaned_str = content_str.strip().replace("```json\n", "").replace("\n```", "")
         
-        # Safely parse the inner JSON
-        # The AI might return a structure like {"keywords": [...]}, so we check for that.
-        json_response = json.loads(cleaned_str)
-        if isinstance(json_response, dict) and "keywords" in json_response:
-             return json_response["keywords"]
-        elif isinstance(json_response, list):
-             return json_response
-        else:
-            return []
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling OpenRouter: {e}")
-        return []
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"Error parsing AI response: {e}")
+        # Clean potential markdown wrapping
+        cleaned_str = content_str.strip()
+        if cleaned_str.startswith("```json"):
+            cleaned_str = cleaned_str.replace("```json", "").replace("```", "").strip()
+        
+        return json.loads(cleaned_str)
+    except Exception as e:
+        print(f"Error calling OpenRouter for category {category}: {e}")
         return []
 
 
 def process_survey_to_preferences(survey_data: dict) -> dict:
     """
-    Processes the raw survey JSON and returns the full, structured preferences object.
+    Convert survey answers into structured preferences using a new categorical approach.
     """
     keywords = {}
+    keyword_sources = {}
+
+    # --- Step 1: Group User Keywords by Category ---
     
-    # --- 1. Rule-Based Extraction ---
-
-    # Language Filter
-    language_filter = [lang.strip() for lang in survey_data.get("15", "English").split(',')]
-
-    # Geo Filter
-    primary_location = survey_data.get("16", "Ahmedabad")
-    geo_filter = GEO_MAP.get(primary_location, [primary_location])
-
-    # Source Filter
-    source_preferences = survey_data.get("11", [])
-    source_filter = []
-    for pref in source_preferences:
-        source_filter.extend(SOURCE_MAP.get(pref, []))
-
-    # --- 2. Keyword & Weight Generation ---
-
-    # From Sub-topics (Q7, Q8, Q9) - Highest weight
-    for q_id in ["7", "8", "9"]:
-        for topic in survey_data.get(q_id, []):
-            keywords[topic] = 1.0
-
-    # From Main Categories (Q5) - Weighted by rank
-    if '5' in survey_data:
-        for category, rank in survey_data['5'].items():
-            weight = max(0.5, 1.1 - (rank * 0.1)) # Rank 1=1.0, 2=0.9, ... 5=0.6
-            keywords[category] = max(keywords.get(category, 0), weight)
+    # Map question IDs to a category name
+    category_map = {
+        "7": "Technology",
+        "8": "Finance",
+        "9": "Local News",
+        "14": "Professional", # For CEO, etc.
+        "16": "Geographical"  # For Ahmedabad, etc.
+    }
     
-    # From Profession (Q14)
-    if survey_data.get("14"):
-        keywords[survey_data["14"]] = 0.8
-
-    # --- 3. AI Keyword Expansion ---
-    
-    # Get the top 5 highest weighted keywords to send to the AI for expansion
-    base_keywords_for_ai = sorted(keywords, key=keywords.get, reverse=True)[:5]
-    ai_expanded_keywords = get_ai_expanded_keywords(base_keywords_for_ai)
-
-    # Add the AI-generated keywords with a moderate weight
-    for kw in ai_expanded_keywords:
-        if kw not in keywords: # Only add if it's a new keyword
-            keywords[kw] = 0.65 
-
-    # --- 4. Assemble Final Output ---
-    
-    final_keywords_list = [{"keyword": k, "weight": v} for k, v in keywords.items()]
-    # Sort by weight descending
-    final_keywords_list.sort(key=lambda x: x['weight'], reverse=True)
-
-    return {
-        "keywords": final_keywords_list,
-        "language_filter": language_filter,
-        "source_filter": list(set(source_filter)), # Remove duplicates
-        "geo_filter": list(set(geo_filter))
+    grouped_keywords = {
+        "Technology": [],
+        "Finance": [],
+        "Local News": [],
+        "Professional": [],
+        "Geographical": []
     }
 
-# --- Main API Endpoint ---
+    # Populate direct keywords from survey sub-topics
+    for qid, category_name in category_map.items():
+        answers = survey_data.get(qid, [])
+        # Ensure answers are in a list format, even for single entries like Q14/Q16
+        if not isinstance(answers, list):
+            answers = [answers]
+        
+        for topic in answers:
+            if topic: # Ensure topic is not empty
+                keywords[topic] = 1.0  # User-selected topics get highest weight
+                keyword_sources[topic] = "user"
+                grouped_keywords[category_name].append(topic)
 
-@app.route("/generate-preferences", methods=["POST"])
+    # Add main ranked categories as lower-weight keywords
+    if '5' in survey_data:
+        for category, rank in survey_data['5'].items():
+            weight = max(0.5, 1.1 - rank * 0.1)
+            if category not in keywords:
+                keywords[category] = weight
+                keyword_sources[category] = "user"
+
+    # --- Step 2: AI Expansion FOR EACH Category ---
+    
+    all_ai_keywords = []
+    for category_name, base_keywords in grouped_keywords.items():
+        if base_keywords: # Only call AI if there are keywords for the category
+            print(f"Expanding keywords for category: {category_name}...")
+            expanded = get_ai_expanded_keywords_for_category(base_keywords, category_name)
+            all_ai_keywords.extend(expanded)
+            print(f"  > AI suggested: {expanded}")
+
+    # Add the AI-generated keywords with a consistent, moderate weight
+    for kw in all_ai_keywords:
+        if kw not in keywords:
+            keywords[kw] = 0.65
+            keyword_sources[kw] = f"ai:{AI_MODEL}"
+
+    # --- Step 3: Assemble Final Output ---
+    final_keywords_list = [
+        {"keyword": k, "weight": v, "source": keyword_sources.get(k, "user")}
+        for k, v in keywords.items()
+    ]
+    final_keywords_list.sort(key=lambda x: x["weight"], reverse=True)
+
+    return {"keywords": final_keywords_list}
+
+@app.route("/", methods=["POST"])
 def generate_preferences_endpoint():
-    """
-    Main endpoint to receive survey data and return structured preferences.
-    """
-    survey_data = request.json
-    if not survey_data:
+    try:
+        survey = request.get_json(force=True)
+    except:
         return jsonify({"error": "Invalid JSON input"}), 400
 
-    try:
-        preferences = process_survey_to_preferences(survey_data)
-        return jsonify(preferences)
-    except Exception as e:
-        # Log the full error for debugging
-        print(f"An error occurred: {e}")
-        return jsonify({"error": "Failed to process survey data."}), 500
+    prefs = process_survey_to_preferences(survey)
+    return jsonify(prefs)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 9090))
+    app.run(host="0.0.0.0", port=port, debug=True)
